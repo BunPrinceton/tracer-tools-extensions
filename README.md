@@ -39,13 +39,13 @@ Experimental, incomplete, or one-off scripts do **not** belong in this repositor
 
 ## Included tools
 
-### Batched / Parallel ID Getter
+### `fast_validate_ids.py` — Batched / Parallel ID Validator
 - Resolves updated or canonical IDs from large input lists
 - Uses batching and threading to avoid slow sequential calls
 - Designed for thousands of IDs per run
 
-### Batched Coordinate Getter / Updater
-- Efficiently fetches or updates coordinates at scale
+### `fast_get_coords.py` — Batched Coordinate Getter
+- Efficiently fetches coordinates at scale
 - Avoids per-ID request overhead
 - Safe for large proofreading datasets
 
