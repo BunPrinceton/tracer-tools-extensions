@@ -67,6 +67,34 @@ python fast_get_coords.py --input ids.txt --output coords.tsv --workers 20
 - Coordinates are converted from nanometers to voxel space using the datastack's viewer resolution
 - Each coordinate is the centroid of one L2 chunk on the neuron (not the soma)
 
+### Mesh pipeline (`state_to_ng_layer_ben.py` + helpers)
+
+Turn a neuroglancer annotation layer into a publicly-viewable precomputed mesh layer in one command. Supports convex hull (default) and 3D alpha-shape ("shrinkwrap") meshing, auto-tunes alpha to produce single-component watertight output, and uploads to a bucket with the correct ACLs and `info` dimensions.
+
+```bash
+# Default: convex hull, uploaded to nokura://tracers/ben/<name>/
+python state_to_ng_layer_ben.py state.json --layer annotation3 --name region_v1
+
+# Shrinkwrap with auto-tuned alpha
+python state_to_ng_layer_ben.py state.json --layer annotation4 --name region_v2 --method alpha
+
+# Override alpha (in nm) and target bucket folder
+python state_to_ng_layer_ben.py state.json --layer my_pts --name foo --method alpha --alpha 8000 --bucket-root nokura://tracers/alice
+```
+
+Prints back the NG layer source URL (e.g. `https://.../<name>|neuroglancer-precomputed:`) and the state.json subsources snippet to paste into your layer config.
+
+**Files:**
+
+- `state_to_ng_layer_ben.py` — orchestrator CLI; calls the three below.
+- `json_to_volume_ben.py` — annotation layer → mesh (`alpha_shape_3d` is the 3D alpha-shape implementation; auto-grow finds smallest alpha that produces a single-component watertight mesh, then fixes face winding).
+- `obj_to_volume_ben.py` — OBJ → precomputed volume folder. Pulls volume bounds from the datastack's EM-source `info` so the bbox works for any datastack (BANC, FlyWire, MANC, retina), not just BANC.
+- `bucket_upload_folder_ben.py` — folder → bucket. Translates `___` substitutes back to `:` in object keys (Windows-safe filenames on disk, real colon names on the bucket). Sets `ACL=public-read` per file via boto3. Verifies anonymous HTTPS HEAD before returning.
+
+**Why these exist:** Jay's upstream `json_to_volume` / `obj_to_volume` / `bucket_upload_folder` crash on Windows + nokura due to (a) `intervaltree` zero-length intervals from sub-µs local IO, (b) Windows rejecting `:` in filenames, and (c) nokura's S3 emulator rejecting bulk `DeleteObjects` without a `Content-MD5` header. These `_ben` versions bypass all three.
+
+**Dependencies (beyond the existing ones):** `trimesh`, `cloud-volume`, `cloud-files`, `boto3`, `scipy`. Nokura uploads require `~/.cloudvolume/secrets/nokura-secret.json`.
+
 ### Shared options
 
 All scripts accept: `--input/-i` (required), `--output/-o` (auto-named from input), `--datastack/-d` (default: `brain_and_nerve_cord`), `--workers/-w` (default: 20).
