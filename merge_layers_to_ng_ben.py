@@ -360,6 +360,7 @@ def merge_layers_to_ng_ben(
     alpha=None,
     auto_grow=True,
     combine="merged",
+    union=False,
     bucket_root="nokura://tracers/ben",
     workdir=None,
     segid=1,
@@ -435,9 +436,23 @@ def merge_layers_to_ng_ben(
             sub_meshes.append(m)
         if not sub_meshes:
             raise ValueError("no per-layer meshes built (all layers had <4 points?)")
-        mesh = trimesh.util.concatenate(sub_meshes)
         alpha_used = max(alphas_used) if alphas_used else None
-        print(f"  [concatenated] V={len(mesh.vertices)} F={len(mesh.faces)} components={mesh.body_count}")
+
+        if union:
+            import time
+            t0 = time.time()
+            print(f"  [union] running boolean union over {len(sub_meshes)} components...")
+            try:
+                mesh = trimesh.boolean.union(sub_meshes)
+                print(f"  [union] done in {time.time()-t0:.1f}s — V={len(mesh.vertices)} F={len(mesh.faces)} components={mesh.body_count} watertight={mesh.is_watertight}")
+            except Exception as e:
+                print(f"  [union] FAILED after {time.time()-t0:.1f}s: {e}")
+                print(f"  [union] falling back to plain concatenation")
+                mesh = trimesh.util.concatenate(sub_meshes)
+                print(f"  [concatenated] V={len(mesh.vertices)} F={len(mesh.faces)} components={mesh.body_count}")
+        else:
+            mesh = trimesh.util.concatenate(sub_meshes)
+            print(f"  [concatenated] V={len(mesh.vertices)} F={len(mesh.faces)} components={mesh.body_count}")
     else:
         raise ValueError(f"unknown combine mode {combine!r}; use 'merged' or 'per-layer'")
 
@@ -496,6 +511,8 @@ def _cli():
                    help="image-layer name substring to prefer when picking the EM source for bbox sizing")
     p.add_argument("--combine", choices=["merged", "per-layer"], default="merged",
                    help="merged (default): one hull/alpha over all points; per-layer: mesh each layer independently then concat (preserves voids between layers)")
+    p.add_argument("--union", action="store_true",
+                   help="(combine=per-layer only) after per-layer meshing, run boolean union over the components so overlapping blobs merge into one watertight surface (cleaner visuals, no overlap creases). Slower (~seconds-minutes); falls back to plain concatenation on failure.")
     p.add_argument("--method", choices=["convex", "alpha"], default="convex")
     p.add_argument("--alpha", type=float, default=None, help="alpha-shape radius (nm); default auto")
     p.add_argument("--no-auto-grow", action="store_true",
@@ -544,6 +561,7 @@ def _cli():
         alpha=args.alpha,
         auto_grow=not args.no_auto_grow,
         combine=args.combine,
+        union=args.union,
         bucket_root=args.bucket_root,
         workdir=args.workdir,
         segid=args.segid,
