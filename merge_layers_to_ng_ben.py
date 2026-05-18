@@ -361,6 +361,9 @@ def merge_layers_to_ng_ben(
     auto_grow=True,
     combine="merged",
     union=False,
+    dilate=0.0,
+    smooth=0,
+    decimate=1.0,
     bucket_root="nokura://tracers/ben",
     workdir=None,
     segid=1,
@@ -438,6 +441,17 @@ def merge_layers_to_ng_ben(
             raise ValueError("no per-layer meshes built (all layers had <4 points?)")
         alpha_used = max(alphas_used) if alphas_used else None
 
+        if dilate > 0:
+            print(f"  [dilate] expanding each component by {dilate:.0f} nm along vertex normals")
+            sub_meshes = [
+                trimesh.Trimesh(
+                    vertices=m.vertices + m.vertex_normals * float(dilate),
+                    faces=m.faces,
+                    process=False,
+                )
+                for m in sub_meshes
+            ]
+
         if union:
             import time
             t0 = time.time()
@@ -455,6 +469,21 @@ def merge_layers_to_ng_ben(
             print(f"  [concatenated] V={len(mesh.vertices)} F={len(mesh.faces)} components={mesh.body_count}")
     else:
         raise ValueError(f"unknown combine mode {combine!r}; use 'merged' or 'per-layer'")
+
+    if smooth > 0:
+        import trimesh.smoothing as _sm
+        f_before = len(mesh.faces)
+        _sm.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=int(smooth))
+        print(f"  [smooth] taubin x{smooth} -> V={len(mesh.vertices)} F={f_before} (preserved)")
+
+    if 0.0 < decimate < 1.0:
+        target = max(4, int(len(mesh.faces) * decimate))
+        f_before = len(mesh.faces)
+        try:
+            mesh = mesh.simplify_quadric_decimation(face_count=target)
+            print(f"  [decimate] {decimate:.2f} -> F: {f_before} -> {len(mesh.faces)}")
+        except Exception as e:
+            print(f"  [decimate] FAILED ({e}); keeping un-decimated mesh")
 
     if workdir is None:
         workdir = tempfile.mkdtemp(prefix=f"tracer_merge_{name}_")
@@ -513,6 +542,12 @@ def _cli():
                    help="merged (default): one hull/alpha over all points; per-layer: mesh each layer independently then concat (preserves voids between layers)")
     p.add_argument("--union", action="store_true",
                    help="(combine=per-layer only) after per-layer meshing, run boolean union over the components so overlapping blobs merge into one watertight surface (cleaner visuals, no overlap creases). Slower (~seconds-minutes); falls back to plain concatenation on failure.")
+    p.add_argument("--dilate", type=float, default=0.0,
+                   help="(combine=per-layer only) inflate each component by N nm outward along vertex normals before union/concat. Use to close small gaps between near-but-non-touching components so they fuse into one piece. e.g. 1500.")
+    p.add_argument("--smooth", type=int, default=0,
+                   help="post-process: N iterations of Taubin smoothing on the final mesh. Reduces sharp transitions at component junctions. e.g. 5-15. Preserves volume better than Laplacian.")
+    p.add_argument("--decimate", type=float, default=1.0,
+                   help="post-process: keep this fraction of faces via quadric decimation (e.g. 0.5 to halve). Default 1.0 = no decimation.")
     p.add_argument("--method", choices=["convex", "alpha"], default="convex")
     p.add_argument("--alpha", type=float, default=None, help="alpha-shape radius (nm); default auto")
     p.add_argument("--no-auto-grow", action="store_true",
@@ -562,6 +597,9 @@ def _cli():
         auto_grow=not args.no_auto_grow,
         combine=args.combine,
         union=args.union,
+        dilate=args.dilate,
+        smooth=args.smooth,
+        decimate=args.decimate,
         bucket_root=args.bucket_root,
         workdir=args.workdir,
         segid=args.segid,
