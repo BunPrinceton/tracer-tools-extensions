@@ -364,6 +364,7 @@ def merge_layers_to_ng_ben(
     dilate=0.0,
     smooth=0,
     decimate=1.0,
+    remesh_pitch=0.0,
     bucket_root="nokura://tracers/ben",
     workdir=None,
     segid=1,
@@ -476,6 +477,26 @@ def merge_layers_to_ng_ben(
         _sm.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=int(smooth))
         print(f"  [smooth] taubin x{smooth} -> V={len(mesh.vertices)} F={f_before} (preserved)")
 
+    if remesh_pitch > 0:
+        import time
+        from skimage.measure import marching_cubes
+        t0 = time.time()
+        print(f"  [remesh] voxelizing at pitch={remesh_pitch:.0f} nm and re-extracting via marching cubes...")
+        vox = mesh.voxelized(pitch=float(remesh_pitch)).fill()
+        f_before, v_before = len(mesh.faces), len(mesh.vertices)
+        # trimesh's VoxelGrid.marching_cubes does NOT apply the world transform, so we
+        # run skimage directly with the correct spacing and shift by vox.origin.
+        matrix = np.pad(vox.matrix.astype(np.float32), 1, mode='constant', constant_values=0.0)
+        verts, faces, _, _ = marching_cubes(matrix, level=0.5, spacing=[float(remesh_pitch)] * 3)
+        verts -= float(remesh_pitch)  # undo the 1-voxel pad
+        verts += np.asarray(vox.translation, dtype=float)  # shift to world coords
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        if mesh.volume < 0:
+            mesh.invert()  # marching cubes returned inward-facing normals; flip them
+        print(f"  [remesh] done in {time.time()-t0:.1f}s -- "
+              f"V: {v_before} -> {len(mesh.vertices)}, F: {f_before} -> {len(mesh.faces)}, "
+              f"watertight={mesh.is_watertight}, body_count={mesh.body_count}, vol={mesh.volume*1e-9:.1f} um^3")
+
     if 0.0 < decimate < 1.0:
         target = max(4, int(len(mesh.faces) * decimate))
         f_before = len(mesh.faces)
@@ -548,6 +569,8 @@ def _cli():
                    help="post-process: N iterations of Taubin smoothing on the final mesh. Reduces sharp transitions at component junctions. e.g. 5-15. Preserves volume better than Laplacian.")
     p.add_argument("--decimate", type=float, default=1.0,
                    help="post-process: keep this fraction of faces via quadric decimation (e.g. 0.5 to halve). Default 1.0 = no decimation.")
+    p.add_argument("--remesh-pitch", type=float, default=0.0,
+                   help="post-process: voxelize the mesh at this pitch (nm) and re-extract surface via marching cubes. Guarantees watertight + clean manifold output regardless of upstream artifacts. Smaller pitch preserves more detail but uses more memory. e.g. 500. Runs before --decimate so the simplifier has a clean input.")
     p.add_argument("--method", choices=["convex", "alpha"], default="convex")
     p.add_argument("--alpha", type=float, default=None, help="alpha-shape radius (nm); default auto")
     p.add_argument("--no-auto-grow", action="store_true",
@@ -600,6 +623,7 @@ def _cli():
         dilate=args.dilate,
         smooth=args.smooth,
         decimate=args.decimate,
+        remesh_pitch=args.remesh_pitch,
         bucket_root=args.bucket_root,
         workdir=args.workdir,
         segid=args.segid,
