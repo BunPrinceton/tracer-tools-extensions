@@ -9,6 +9,17 @@ state.json, so it doesn't depend on tracer_tools' utils.get_config /
 get_anno_array_from_json (which aren't published yet). Only external sibling
 import is bucket_upload_folder_ben for the upload step.
 
+Combine modes (--combine):
+  - merged (default): concatenate the point clouds from all selected layers BEFORE
+    meshing. One global hull/alpha shape. Bridges naturally across layers but
+    will fill in intentional voids between clusters (e.g. a tower-with-base gap
+    becomes a bell shape).
+  - per-layer: mesh each layer independently, then concatenate the meshes into
+    a single OBJ. Voids between layers are preserved (each blob is its own
+    watertight shape). Best when the layers represent structurally distinct
+    pieces (towers, U-shapes, separated chambers) and the inter-layer gaps
+    should remain empty.
+
 Default layer selection:
   - Picks every layer with type=="annotation" in the state.json.
   - Excludes layers whose name matches the --exclude list (default:
@@ -288,6 +299,19 @@ def _write_mesh_files(image_dir, mesh, segid=1):
         f.write(cv_mesh.to_precomputed())
 
 
+# ---------- single mesh build (called once for combine=merged, N times for per-layer) ----------
+
+def _build_mesh(points, method, alpha, auto_grow):
+    """Build a single mesh from a point array. Returns (mesh, alpha_used_or_None)."""
+    import trimesh
+    if method == "convex":
+        return trimesh.PointCloud(points).convex_hull, None
+    if method == "alpha":
+        v, f, a = alpha_shape_3d(points, alpha=alpha, auto_grow=auto_grow)
+        return trimesh.Trimesh(vertices=v, faces=f, process=False), a
+    raise ValueError(f"unknown method {method!r}; use 'convex' or 'alpha'")
+
+
 # ---------- bucket_upload_folder_ben locator (the only sibling we still need) ----------
 
 def _find_ben_dir():
@@ -334,6 +358,8 @@ def merge_layers_to_ng_ben(
     em_layer_name_hint="BANC EM",
     method="convex",
     alpha=None,
+    auto_grow=True,
+    combine="merged",
     bucket_root="nokura://tracers/ben",
     workdir=None,
     segid=1,
@@ -360,6 +386,7 @@ def merge_layers_to_ng_ben(
     layers_by_name = {l.get("name"): l for l in state.get("layers", []) if l.get("type") == "annotation"}
 
     per_layer_points_nm = []
+    used_layer_names = []
     point_counts = []
     for ln in layer_names:
         layer = layers_by_name.get(ln)
@@ -375,23 +402,44 @@ def merge_layers_to_ng_ben(
         # voxel -> nm
         pts_nm = pts_voxel * np.asarray(voxel_scale, dtype=float)
         per_layer_points_nm.append(pts_nm)
+        used_layer_names.append(ln)
         point_counts.append(len(pts_nm))
         print(f"  [layer] {ln}: {len(pts_nm)} points")
 
     if not per_layer_points_nm:
         raise ValueError("all selected layers were empty after loading points")
 
-    merged = np.concatenate(per_layer_points_nm, axis=0)
-    print(f"  [merged] {len(merged)} total points across {len(per_layer_points_nm)} layers")
-
-    if method == "convex":
-        mesh = trimesh.PointCloud(merged).convex_hull
-        alpha_used = None
-    elif method == "alpha":
-        verts, faces, alpha_used = alpha_shape_3d(merged, alpha=alpha)
-        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    if combine == "merged":
+        merged = np.concatenate(per_layer_points_nm, axis=0)
+        print(f"  [combine=merged] {len(merged)} total points across {len(per_layer_points_nm)} layers")
+        mesh, alpha_used = _build_mesh(merged, method, alpha, auto_grow)
+    elif combine == "per-layer":
+        print(f"  [combine=per-layer] meshing {len(per_layer_points_nm)} layers independently")
+        sub_meshes = []
+        alphas_used = []
+        for ln, pts in zip(used_layer_names, per_layer_points_nm):
+            if len(pts) < 4:
+                print(f"    [skip mesh] {ln}: needs >=4 points for 3D hull")
+                continue
+            try:
+                m, a = _build_mesh(pts, method, alpha, auto_grow)
+            except Exception as e:
+                if method == "alpha":
+                    print(f"    [fallback convex] {ln}: alpha failed ({e})")
+                    m, a = _build_mesh(pts, "convex", None, False)
+                else:
+                    raise
+            if a is not None:
+                alphas_used.append(a)
+            print(f"    [mesh] {ln}: V={len(m.vertices)} F={len(m.faces)} watertight={m.is_watertight}")
+            sub_meshes.append(m)
+        if not sub_meshes:
+            raise ValueError("no per-layer meshes built (all layers had <4 points?)")
+        mesh = trimesh.util.concatenate(sub_meshes)
+        alpha_used = max(alphas_used) if alphas_used else None
+        print(f"  [concatenated] V={len(mesh.vertices)} F={len(mesh.faces)} components={mesh.body_count}")
     else:
-        raise ValueError(f"unknown method {method!r}; use 'convex' or 'alpha'")
+        raise ValueError(f"unknown combine mode {combine!r}; use 'merged' or 'per-layer'")
 
     if workdir is None:
         workdir = tempfile.mkdtemp(prefix=f"tracer_merge_{name}_")
@@ -446,8 +494,12 @@ def _cli():
                    help="skip auto-discovered layers with fewer than this many annotations (default 10; 0 = include all)")
     p.add_argument("--em-layer-hint", default="BANC EM",
                    help="image-layer name substring to prefer when picking the EM source for bbox sizing")
+    p.add_argument("--combine", choices=["merged", "per-layer"], default="merged",
+                   help="merged (default): one hull/alpha over all points; per-layer: mesh each layer independently then concat (preserves voids between layers)")
     p.add_argument("--method", choices=["convex", "alpha"], default="convex")
     p.add_argument("--alpha", type=float, default=None, help="alpha-shape radius (nm); default auto")
+    p.add_argument("--no-auto-grow", action="store_true",
+                   help="(method=alpha only) use --alpha exactly; don't grow it until single-component/watertight. May produce holes or disconnected pieces if alpha is too small.")
     p.add_argument("--bucket-root", default="nokura://tracers/ben")
     p.add_argument("--workdir", default=None)
     p.add_argument("--segid", type=int, default=1)
@@ -490,6 +542,8 @@ def _cli():
         em_layer_name_hint=args.em_layer_hint,
         method=args.method,
         alpha=args.alpha,
+        auto_grow=not args.no_auto_grow,
+        combine=args.combine,
         bucket_root=args.bucket_root,
         workdir=args.workdir,
         segid=args.segid,
