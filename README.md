@@ -95,6 +95,45 @@ Prints back the NG layer source URL (e.g. `https://.../<name>|neuroglancer-preco
 
 **Dependencies (beyond the existing ones):** `trimesh`, `cloud-volume`, `cloud-files`, `boto3`, `scipy`. Nokura uploads require `~/.cloudvolume/secrets/nokura-secret.json`.
 
+### `merge_layers_to_ng_ben.py` — Multi-layer mesh merger
+
+Combines multiple annotation layers from a Neuroglancer state into **one** hosted mesh — versus `state_to_ng_layer_ben.py`, which builds one mesh per `--layer` invocation. Useful when N point-annotation clusters should be visualized as a single 3D region (e.g. 12 sub-regions of a brain structure → one watertight envelope for neuron-passes-through testing).
+
+**Self-contained** — pulls voxel scale from the state's `dimensions` field and the EM source URL from the image layer directly, so it doesn't depend on `tracer_tools.utils` like the other `_ben` scripts.
+
+```bash
+# Auto-pick all annotation layers (excluding region_boundaries/region_outlines/bbox
+# variants and stray layers with <10 points), build one convex hull, upload to nokura.
+python merge_layers_to_ng_ben.py state.json --name all_regions
+
+# Recommended pipeline for a clean watertight result suitable for inclusion testing:
+python merge_layers_to_ng_ben.py state.json --name all_regions \
+  --combine per-layer --method alpha --union \
+  --dilate 1500 --smooth 40 --remesh-pitch 500
+
+# Preview the resolved layer set without building or uploading anything:
+python merge_layers_to_ng_ben.py state.json --name foo --dry-run
+```
+
+**Combine modes:**
+
+- `--combine merged` (default) — concatenate point clouds from all layers, then build ONE mesh. Bridges naturally across layers but fills intentional voids (e.g. tower-over-base becomes a bell shape).
+- `--combine per-layer` — mesh each layer independently, then concatenate. Preserves voids between non-touching clusters (each blob is its own watertight shape).
+
+**Post-processing (combine=per-layer):**
+
+- `--union` — boolean union (manifold3d) over per-layer components. Fuses overlapping blobs into one watertight surface, eliminating visible overlap creases. Falls back to plain concatenation on failure.
+- `--dilate <nm>` — inflate each component along vertex normals before union to bridge near-but-non-touching clusters.
+- `--smooth <N>` — N Taubin smoothing iterations on the final mesh. Topology-preserving (watertight stays `True`). Each +20 iters slightly shrinks volume.
+- `--remesh-pitch <nm>` — voxelize at this pitch and re-extract surface via marching cubes. **Guarantees watertight + manifold output** regardless of upstream artifacts. Use this instead of `--decimate` whenever testing/inclusion-correctness matters.
+- `--decimate <fraction>` — quadric edge-collapse simplification (fast-simplification backend). Note: can break watertightness by creating non-manifold geometry — `--remesh-pitch` is the safer knob for "smaller + still watertight."
+
+**Layer auto-discovery:** picks every `type=="annotation"` layer minus `--exclude` names (region_boundaries / region_outlines / bbox variants) and layers below `--min-points` annotations (default 10 — filters orphan/stray layers without hard-coded names). Pass `--layers a,b,c` to override.
+
+**Dependencies (beyond the mesh-pipeline ones):** `manifold3d` (for `--union`), `scikit-image` (for `--remesh-pitch`), `fast-simplification` (for `--decimate`).
+
+A complete worked example with the resulting OBJ and a public Neuroglancer source URL lives in [`examples/`](examples/).
+
 ### Shared options
 
 All scripts accept: `--input/-i` (required), `--output/-o` (auto-named from input), `--datastack/-d` (default: `brain_and_nerve_cord`), `--workers/-w` (default: 20).
