@@ -4,6 +4,11 @@ Same end-to-end flow as state_to_ng_layer_ben, but the point clouds from N
 annotation layers are concatenated BEFORE meshing, producing a single connected
 shape (one convex hull or one alpha shape) rather than N separate meshes.
 
+Self-contained: derives voxel scale + EM source URL directly from the
+state.json, so it doesn't depend on tracer_tools' utils.get_config /
+get_anno_array_from_json (which aren't published yet). Only external sibling
+import is bucket_upload_folder_ben for the upload step.
+
 Default layer selection:
   - Picks every layer with type=="annotation" in the state.json.
   - Excludes layers whose name matches the --exclude list (default:
@@ -26,6 +31,8 @@ import sys
 import json
 import tempfile
 import argparse
+import urllib.request
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -46,23 +53,254 @@ DEFAULT_EXCLUDE = [
 ]
 
 
+# ---------- state.json helpers (replace tracer_tools.utils.get_config + get_anno_array_from_json) ----------
+
+def _norm(s):
+    return "".join(s.lower().split()).replace("_", "").replace("-", "")
+
+
+def _load_state(json_filepath):
+    with open(json_filepath) as f:
+        return json.load(f)
+
+
+def _voxel_scale_from_state(state):
+    """Voxel size in nm per axis, read from the state's top-level 'dimensions' field.
+
+    Neuroglancer stores each axis as [value, unit] where unit is "m" (meters),
+    "nm", etc. We normalize to nm.
+    """
+    dims = state.get("dimensions") or {}
+    scale = []
+    for ax in ("x", "y", "z"):
+        if ax not in dims:
+            raise ValueError(f"state.json missing dimensions.{ax}; cannot derive voxel scale")
+        val, unit = dims[ax]
+        unit = unit.lower()
+        if unit == "m":
+            scale.append(float(val) * 1e9)
+        elif unit == "nm":
+            scale.append(float(val))
+        elif unit == "um":
+            scale.append(float(val) * 1e3)
+        else:
+            raise ValueError(f"unsupported dimensions unit {unit!r} for {ax}; want m/nm/um")
+    return scale
+
+
+def _em_source_url_from_state(state, prefer_name_contains=None):
+    """Pull the EM (image-layer) source URL from the state.
+
+    If multiple image layers exist, prefer one whose name contains
+    prefer_name_contains (case-insensitive); otherwise return the first.
+    Strips a leading 'precomputed://' if present.
+    """
+    candidates = []
+    for layer in state.get("layers", []):
+        if layer.get("type") != "image":
+            continue
+        src = layer.get("source")
+        url = src.get("url") if isinstance(src, dict) else src
+        if not url:
+            continue
+        candidates.append((layer.get("name", ""), url))
+    if not candidates:
+        raise ValueError("no image layer with a source URL found in state.json")
+    if prefer_name_contains:
+        needle = prefer_name_contains.lower()
+        for name, url in candidates:
+            if needle in name.lower():
+                url = url
+                break
+        else:
+            url = candidates[0][1]
+    else:
+        url = candidates[0][1]
+    if url.startswith("precomputed://"):
+        url = url[len("precomputed://"):]
+    return url.rstrip("/")
+
+
+def _fetch_em_source_size(em_url):
+    """Return (size, voxel_offset, resolution) from <em_url>/info.
+
+    Routes gs:// through the public storage.googleapis.com HTTPS endpoint
+    (these EM source buckets are public). Falls back to cloudfiles for
+    other protocols (s3://, nokura://, etc).
+    """
+    info = None
+    if em_url.startswith("gs://"):
+        https_url = "https://storage.googleapis.com/" + em_url[len("gs://"):] + "/info"
+        with urllib.request.urlopen(https_url, timeout=15) as resp:
+            info = json.loads(resp.read())
+    elif em_url.startswith(("http://", "https://")):
+        with urllib.request.urlopen(em_url + "/info", timeout=15) as resp:
+            info = json.loads(resp.read())
+    else:
+        from cloudfiles import CloudFiles
+        info = CloudFiles(em_url).get_json("info")
+    if info is None:
+        raise RuntimeError(f"could not fetch info from {em_url}/info")
+    scale = info["scales"][0]
+    return scale["size"], scale.get("voxel_offset", [0, 0, 0]), scale["resolution"]
+
+
+def _points_from_annotation_layer(layer):
+    """Return (n, 3) array of point coords (voxel units, as stored in the state).
+
+    Accepts annotations of type 'point' (uses 'point') or 'ellipsoid' (uses
+    'center'). Other types (line/aabb) are skipped — they don't naturally
+    contribute a single representative point.
+    """
+    out = []
+    for a in layer.get("annotations", []):
+        p = a.get("point") or a.get("center")
+        if p is None or len(p) < 3:
+            continue
+        out.append([float(p[0]), float(p[1]), float(p[2])])
+    return np.asarray(out, dtype=float)
+
+
+# ---------- mesh build + volume packaging (inlined from json_to_volume_ben) ----------
+
+def _tet_circumradii(tetras):
+    p0 = tetras[:, 0]
+    a = tetras[:, 1] - p0
+    b = tetras[:, 2] - p0
+    c = tetras[:, 3] - p0
+    A = np.stack([a, b, c], axis=1)
+    rhs = 0.5 * np.stack([(a*a).sum(1), (b*b).sum(1), (c*c).sum(1)], axis=1)
+    try:
+        x = np.linalg.solve(A, rhs[..., None])[..., 0]
+    except np.linalg.LinAlgError:
+        x = np.zeros_like(rhs)
+        for i in range(A.shape[0]):
+            try:
+                x[i] = np.linalg.solve(A[i], rhs[i])
+            except np.linalg.LinAlgError:
+                x[i] = np.full(3, np.inf)
+    return np.linalg.norm(x, axis=1)
+
+
+def _alpha_shape_once(points, tess, radii, alpha):
+    keep = tess.simplices[radii < alpha]
+    if len(keep) == 0:
+        return None, None, 0
+    face_counter = Counter()
+    for tet in keep:
+        for combo in ((0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)):
+            face_counter[tuple(sorted(int(tet[i]) for i in combo))] += 1
+    faces = np.array([f for f, c in face_counter.items() if c == 1], dtype=np.int64)
+    if len(faces) == 0:
+        return None, None, len(keep)
+    used = np.unique(faces.ravel())
+    remap = -np.ones(len(points), dtype=np.int64)
+    remap[used] = np.arange(len(used))
+    return points[used], remap[faces], len(keep)
+
+
+def alpha_shape_3d(points, alpha=None, auto_grow=True, max_iters=15):
+    """3D alpha shape (concave hull) via Delaunay tetrahedralization."""
+    import trimesh
+    from scipy.spatial import Delaunay, cKDTree
+
+    points = np.asarray(points, dtype=float)
+    tess = Delaunay(points)
+    tets = points[tess.simplices]
+    radii = _tet_circumradii(tets)
+
+    if alpha is None:
+        kd = cKDTree(points)
+        nn_dist, _ = kd.query(points, k=2)
+        alpha = 1.5 * float(np.median(nn_dist[:, 1]))
+
+    if not auto_grow:
+        v, f, _ = _alpha_shape_once(points, tess, radii, alpha)
+        if v is None:
+            raise ValueError(f"alpha={alpha:.1f} produced no boundary triangles.")
+        return v, f, alpha
+
+    single_piece = None
+    cur_alpha = alpha
+    for _ in range(max_iters):
+        v, f, _ = _alpha_shape_once(points, tess, radii, cur_alpha)
+        if v is None:
+            cur_alpha *= 1.5
+            continue
+        m = trimesh.Trimesh(vertices=v, faces=f, process=False)
+        if m.body_count == 1:
+            if single_piece is None:
+                single_piece = (v, f, cur_alpha)
+            if m.is_watertight:
+                m.fix_normals()
+                return np.asarray(m.vertices), np.asarray(m.faces), cur_alpha
+        cur_alpha *= 1.5
+
+    if single_piece is None:
+        raise ValueError(f"alpha shape failed to produce a single-component mesh up to {cur_alpha:.1f}.")
+    return single_piece
+
+
+def _write_volume_packaging(output_filepath, voxel_scale, em_url):
+    """Create <output_filepath>/image/{info, mesh/info} sized to the EM source."""
+    em_size, em_offset, em_res = _fetch_em_source_size(em_url)
+    size = [int(em_size[i] * em_res[i] / voxel_scale[i]) for i in range(3)]
+    voxel_offset = [int(em_offset[i] * em_res[i] / voxel_scale[i]) for i in range(3)]
+
+    image_dir = os.path.join(output_filepath, "image")
+    mesh_dir = os.path.join(image_dir, "mesh")
+    os.makedirs(mesh_dir, exist_ok=True)
+
+    info = {
+        "num_channels": 1,
+        "type": "segmentation",
+        "data_type": "uint64",
+        "scales": [{
+            "encoding": "raw",
+            "chunk_sizes": [[512, 512, 16]],
+            "key": "_".join(str(v) for v in voxel_scale),
+            "resolution": voxel_scale,
+            "voxel_offset": voxel_offset,
+            "size": size,
+        }],
+        "mesh": "mesh",
+    }
+    with open(os.path.join(image_dir, "info"), "w") as f:
+        json.dump(info, f)
+
+    mesh_info = {"@type": "neuroglancer_legacy_mesh", "transform": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]}
+    with open(os.path.join(mesh_dir, "info"), "w") as f:
+        json.dump(mesh_info, f)
+    return image_dir
+
+
+def _write_mesh_files(image_dir, mesh, segid=1):
+    """Write the manifest + binary fragment to image/mesh/ with '___' substitutes
+    (translated back to ':' by bucket_upload_folder_ben on upload)."""
+    import cloudvolume
+    mesh_dir = os.path.join(image_dir, "mesh")
+    cv_mesh = cloudvolume.Mesh(vertices=np.asarray(mesh.vertices), faces=np.asarray(mesh.faces), segid=segid)
+    manifest_path = os.path.join(mesh_dir, f"{segid}___0")
+    fragment_path = os.path.join(mesh_dir, f"{segid}___0___1")
+    with open(manifest_path, "w") as f:
+        json.dump({"fragments": [f"{segid}:0:1"]}, f)
+    with open(fragment_path, "wb") as f:
+        f.write(cv_mesh.to_precomputed())
+
+
+# ---------- bucket_upload_folder_ben locator (the only sibling we still need) ----------
+
 def _find_ben_dir():
     here = Path(__file__).resolve().parent
-    if (here / "json_to_volume_ben.py").exists():
+    if (here / "bucket_upload_folder_ben.py").exists():
         return here
     for sib in (here / "tracer_tools" / "src", here.parent / "tracer_tools" / "src"):
-        if (sib / "json_to_volume_ben.py").exists():
+        if (sib / "bucket_upload_folder_ben.py").exists():
             return sib
     return None
 
 
-_ben_dir = _find_ben_dir()
-if _ben_dir is None:
-    print("ERROR: could not locate the *_ben.py modules. Place this script next to "
-          "json_to_volume_ben.py / obj_to_volume_ben.py / bucket_upload_folder_ben.py.")
-    sys.exit(1)
-sys.path.insert(0, str(_ben_dir))
-
+# ---------- public layer discovery + merge entrypoint ----------
 
 def discover_annotation_layers(json_filepath, exclude=None, min_points=10):
     """Return [layer_name, ...] for every type=='annotation' layer in the state,
@@ -72,9 +310,7 @@ def discover_annotation_layers(json_filepath, exclude=None, min_points=10):
         exclude = DEFAULT_EXCLUDE
     norm_excl = {_norm(n) for n in exclude}
 
-    with open(json_filepath) as f:
-        state = json.load(f)
-
+    state = _load_state(json_filepath)
     names = []
     for layer in state.get("layers", []):
         if layer.get("type") != "annotation":
@@ -89,17 +325,13 @@ def discover_annotation_layers(json_filepath, exclude=None, min_points=10):
     return names
 
 
-def _norm(s):
-    return "".join(s.lower().split()).replace("_", "").replace("-", "")
-
-
 def merge_layers_to_ng_ben(
     json_filepath,
     name,
     layer_names=None,
     exclude=None,
     min_points=10,
-    datastack_name="brain_and_nerve_cord",
+    em_layer_name_hint="BANC EM",
     method="convex",
     alpha=None,
     bucket_root="nokura://tracers/ben",
@@ -110,71 +342,47 @@ def merge_layers_to_ng_ben(
 ):
     """Merge N annotation layers' points into ONE mesh and (optionally) upload it.
 
-    Args:
-      json_filepath: absolute path to a NG state.json.
-      name: short name for the new mesh (used as the bucket folder).
-      layer_names: explicit list of annotation layer names to merge. If None,
-                   auto-discover all annotation-type layers, minus `exclude`.
-      exclude: list of layer names to skip during auto-discovery
-               (default: region_boundaries/region_outlines/bbox variants).
-      min_points: minimum annotation count for a layer to be auto-included
-                  (default 10; set to 0 to include everything).
-      datastack_name: datastack the state is from (controls voxel scale + info bounds).
-      method: "convex" (default) or "alpha".
-      alpha: alpha-shape radius in nm; None=auto.
-      bucket_root: bucket prefix; default 'nokura://tracers/ben'.
-      workdir: scratch folder; default a temp dir.
-      segid: integer segment id for the mesh.
-      export_obj: also write the merged OBJ alongside the volume.
-      upload: if False, skip the bucket upload step (local-only build).
-
     Returns dict with keys:
-      'layers_used': [str, ...] — layer names actually merged
-      'point_counts': [int, ...] — per-layer point counts (same order)
-      'total_points': int
-      'mesh': trimesh.Trimesh — the merged mesh
-      'obj_path': str | None
-      'volume_path': str
-      'alpha_used': float | None
-      'bucket_path': str | None
-      'https_url': str | None
-      'ng_source': str | None
+      'layers_used', 'point_counts', 'total_points', 'mesh', 'obj_path',
+      'volume_path', 'alpha_used', 'bucket_path', 'https_url', 'ng_source'.
     """
-    # Imports deferred so --dry-run doesn't require trimesh/cloudvolume/etc.
     import trimesh
-    from json_to_volume_ben import (
-        alpha_shape_3d,
-        _write_volume_packaging,
-        _write_mesh_files,
-    )
-    from tracer_tools.utils import get_config, get_anno_array_from_json, convert_coord_res
+
+    state = _load_state(json_filepath)
+    voxel_scale = _voxel_scale_from_state(state)
+    em_url = _em_source_url_from_state(state, prefer_name_contains=em_layer_name_hint)
 
     if layer_names is None:
         layer_names = discover_annotation_layers(json_filepath, exclude=exclude, min_points=min_points)
     if not layer_names:
         raise ValueError("no annotation layers selected; pass --layers or relax --exclude/--min-points")
 
-    cfg = get_config(datastack_name)
-    voxel_scale = cfg["voxel_scale"]
+    layers_by_name = {l.get("name"): l for l in state.get("layers", []) if l.get("type") == "annotation"}
 
-    per_layer_points = []
+    per_layer_points_nm = []
     point_counts = []
     for ln in layer_names:
-        pts_voxel = get_anno_array_from_json(ln, json_filepath=json_filepath)
-        if pts_voxel is None or len(pts_voxel) == 0:
-            print(f"  [skip] {ln}: no point annotations")
+        layer = layers_by_name.get(ln)
+        if layer is None:
+            print(f"  [skip] {ln}: not found in state")
             point_counts.append(0)
             continue
-        pts_nm = np.array([convert_coord_res(p, res_current=voxel_scale, res_desired=[1, 1, 1]) for p in pts_voxel])
-        per_layer_points.append(pts_nm)
+        pts_voxel = _points_from_annotation_layer(layer)
+        if len(pts_voxel) == 0:
+            print(f"  [skip] {ln}: no point-bearing annotations")
+            point_counts.append(0)
+            continue
+        # voxel -> nm
+        pts_nm = pts_voxel * np.asarray(voxel_scale, dtype=float)
+        per_layer_points_nm.append(pts_nm)
         point_counts.append(len(pts_nm))
         print(f"  [layer] {ln}: {len(pts_nm)} points")
 
-    if not per_layer_points:
+    if not per_layer_points_nm:
         raise ValueError("all selected layers were empty after loading points")
 
-    merged = np.concatenate(per_layer_points, axis=0)
-    print(f"  [merged] {len(merged)} total points across {len(per_layer_points)} layers")
+    merged = np.concatenate(per_layer_points_nm, axis=0)
+    print(f"  [merged] {len(merged)} total points across {len(per_layer_points_nm)} layers")
 
     if method == "convex":
         mesh = trimesh.PointCloud(merged).convex_hull
@@ -195,11 +403,15 @@ def merge_layers_to_ng_ben(
         obj_path = os.path.join(workdir, f"{name}_merged_{suffix}.obj")
         mesh.export(obj_path, file_type="obj")
 
-    volume_path = _write_volume_packaging(workdir, datastack_name)
+    volume_path = _write_volume_packaging(workdir, voxel_scale, em_url)
     _write_mesh_files(volume_path, mesh, segid=segid)
 
     bucket_path = https_url = ng_source = None
     if upload:
+        ben_dir = _find_ben_dir()
+        if ben_dir is None:
+            raise RuntimeError("bucket_upload_folder_ben.py not found beside this script; pass --no-upload to skip")
+        sys.path.insert(0, str(ben_dir))
         from bucket_upload_folder_ben import bucket_upload_folder_ben, ng_layer_source_for
         bucket_path = f"{bucket_root.rstrip('/')}/{name}"
         up = bucket_upload_folder_ben(local_path=volume_path, bucket_path=bucket_path, public_read=True)
@@ -232,7 +444,8 @@ def _cli():
                    help="comma-separated names to skip during auto-discovery (case/space/underscore insensitive)")
     p.add_argument("--min-points", type=int, default=10,
                    help="skip auto-discovered layers with fewer than this many annotations (default 10; 0 = include all)")
-    p.add_argument("--datastack", default="brain_and_nerve_cord")
+    p.add_argument("--em-layer-hint", default="BANC EM",
+                   help="image-layer name substring to prefer when picking the EM source for bbox sizing")
     p.add_argument("--method", choices=["convex", "alpha"], default="convex")
     p.add_argument("--alpha", type=float, default=None, help="alpha-shape radius (nm); default auto")
     p.add_argument("--bucket-root", default="nokura://tracers/ben")
@@ -241,11 +454,7 @@ def _cli():
     p.add_argument("--no-upload", action="store_true", help="build mesh + volume locally, skip bucket upload")
     p.add_argument("--dry-run", action="store_true",
                    help="just print the resolved layer list and per-layer point counts; no mesh build, no upload")
-    p.add_argument("--tracer-path", default=None, help="manual path to tracer_tools/src (only if auto-detect failed)")
     args = p.parse_args()
-
-    if args.tracer_path:
-        sys.path.insert(0, args.tracer_path)
 
     layer_names = [s.strip() for s in args.layers.split(",")] if args.layers else None
     exclude = [s.strip() for s in args.exclude.split(",")] if args.exclude else []
@@ -253,8 +462,7 @@ def _cli():
     if args.dry_run:
         if layer_names is None:
             layer_names = discover_annotation_layers(args.json_filepath, exclude=exclude, min_points=args.min_points)
-        with open(args.json_filepath) as f:
-            state = json.load(f)
+        state = _load_state(args.json_filepath)
         counts_by_name = {
             l.get("name"): len(l.get("annotations", []))
             for l in state.get("layers", []) if l.get("type") == "annotation"
@@ -265,10 +473,12 @@ def _cli():
             c = counts_by_name.get(ln, 0)
             total += c
             print(f"  {ln}: {c} annotations")
-        print(f"--- total: {total} annotations (raw count; per-layer point yield may differ if non-point types are present) ---")
+        print(f"--- total: {total} annotations ---")
         skipped = [n for n, _ in counts_by_name.items() if n not in layer_names]
         if skipped:
-            print(f"skipped (excluded or empty): {skipped}")
+            print(f"skipped (excluded or below --min-points): {skipped}")
+        print(f"\nvoxel scale (nm): {_voxel_scale_from_state(state)}")
+        print(f"EM source URL:   {_em_source_url_from_state(state, prefer_name_contains=args.em_layer_hint)}")
         return
 
     result = merge_layers_to_ng_ben(
@@ -277,7 +487,7 @@ def _cli():
         layer_names=layer_names,
         exclude=exclude,
         min_points=args.min_points,
-        datastack_name=args.datastack,
+        em_layer_name_hint=args.em_layer_hint,
         method=args.method,
         alpha=args.alpha,
         bucket_root=args.bucket_root,
