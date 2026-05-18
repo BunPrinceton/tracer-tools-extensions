@@ -10,6 +10,9 @@ Default layer selection:
     region_boundaries, region_outlines, region_boundary, region_outline,
     bounding_box, bounds, bbox). These are typically bbox/outline annotations
     unrelated to the structures being meshed.
+  - Excludes layers with fewer than --min-points annotations (default 10) —
+    filters out orphan/stray layers (e.g. a UI-deleted layer that still sits in
+    the JSON with 1-3 points) without needing to hard-code their names.
   - Pass --layers a,b,c to override and use an explicit list instead.
 
 Example:
@@ -61,9 +64,10 @@ if _ben_dir is None:
 sys.path.insert(0, str(_ben_dir))
 
 
-def discover_annotation_layers(json_filepath, exclude=None):
+def discover_annotation_layers(json_filepath, exclude=None, min_points=10):
     """Return [layer_name, ...] for every type=='annotation' layer in the state,
-    minus any whose name matches `exclude` (case/space/underscore insensitive)."""
+    minus any whose name matches `exclude` (case/space/underscore insensitive)
+    or that has fewer than `min_points` annotations."""
     if exclude is None:
         exclude = DEFAULT_EXCLUDE
     norm_excl = {_norm(n) for n in exclude}
@@ -78,7 +82,8 @@ def discover_annotation_layers(json_filepath, exclude=None):
         name = layer.get("name", "")
         if _norm(name) in norm_excl:
             continue
-        if not layer.get("annotations"):
+        anns = layer.get("annotations", [])
+        if len(anns) < min_points:
             continue
         names.append(name)
     return names
@@ -93,6 +98,7 @@ def merge_layers_to_ng_ben(
     name,
     layer_names=None,
     exclude=None,
+    min_points=10,
     datastack_name="brain_and_nerve_cord",
     method="convex",
     alpha=None,
@@ -111,6 +117,8 @@ def merge_layers_to_ng_ben(
                    auto-discover all annotation-type layers, minus `exclude`.
       exclude: list of layer names to skip during auto-discovery
                (default: region_boundaries/region_outlines/bbox variants).
+      min_points: minimum annotation count for a layer to be auto-included
+                  (default 10; set to 0 to include everything).
       datastack_name: datastack the state is from (controls voxel scale + info bounds).
       method: "convex" (default) or "alpha".
       alpha: alpha-shape radius in nm; None=auto.
@@ -142,9 +150,9 @@ def merge_layers_to_ng_ben(
     from tracer_tools.utils import get_config, get_anno_array_from_json, convert_coord_res
 
     if layer_names is None:
-        layer_names = discover_annotation_layers(json_filepath, exclude=exclude)
+        layer_names = discover_annotation_layers(json_filepath, exclude=exclude, min_points=min_points)
     if not layer_names:
-        raise ValueError("no annotation layers selected; pass --layers or check --exclude")
+        raise ValueError("no annotation layers selected; pass --layers or relax --exclude/--min-points")
 
     cfg = get_config(datastack_name)
     voxel_scale = cfg["voxel_scale"]
@@ -222,6 +230,8 @@ def _cli():
                    help="comma-separated layer names to merge; if omitted, auto-pick all annotation layers minus --exclude")
     p.add_argument("--exclude", default=",".join(DEFAULT_EXCLUDE),
                    help="comma-separated names to skip during auto-discovery (case/space/underscore insensitive)")
+    p.add_argument("--min-points", type=int, default=10,
+                   help="skip auto-discovered layers with fewer than this many annotations (default 10; 0 = include all)")
     p.add_argument("--datastack", default="brain_and_nerve_cord")
     p.add_argument("--method", choices=["convex", "alpha"], default="convex")
     p.add_argument("--alpha", type=float, default=None, help="alpha-shape radius (nm); default auto")
@@ -242,7 +252,7 @@ def _cli():
 
     if args.dry_run:
         if layer_names is None:
-            layer_names = discover_annotation_layers(args.json_filepath, exclude=exclude)
+            layer_names = discover_annotation_layers(args.json_filepath, exclude=exclude, min_points=args.min_points)
         with open(args.json_filepath) as f:
             state = json.load(f)
         counts_by_name = {
@@ -266,6 +276,7 @@ def _cli():
         name=args.name,
         layer_names=layer_names,
         exclude=exclude,
+        min_points=args.min_points,
         datastack_name=args.datastack,
         method=args.method,
         alpha=args.alpha,
