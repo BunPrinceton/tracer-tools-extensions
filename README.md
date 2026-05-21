@@ -95,6 +95,51 @@ Prints back the NG layer source URL (e.g. `https://.../<name>|neuroglancer-preco
 
 **Dependencies (beyond the existing ones):** `trimesh`, `cloud-volume`, `cloud-files`, `boto3`, `scipy`. Nokura uploads require `~/.cloudvolume/secrets/nokura-secret.json`.
 
+### 2D + 3D viewable layers (`state_to_ng_seg_layer_ben.py` + `serve_local_precomputed_ben.py`)
+
+Extends the mesh pipeline: in addition to the 3D mesh, voxelizes the mesh into a chunked precomputed **segmentation volume** so the layer also shows up in NG's 2D cross-section panel — like a regular proofreading layer, but for any shape you can outline with annotation points. Includes a tiny local CORS HTTP server so you can preview the result in NG before uploading anything.
+
+```bash
+# 1. Generate mesh + seg volume LOCALLY (no upload, no nokura quota burn)
+python state_to_ng_seg_layer_ben.py state.json \
+    --layer annotation1 --name my_region \
+    --method alpha --seg-resolution 128,128,90 \
+    --workdir C:\path\to\workdir --no-upload
+
+# 2. Serve the resulting precomputed folder locally with CORS
+python serve_local_precomputed_ben.py C:\path\to\workdir\image
+# -> http://localhost:9000
+
+# 3. In your NG instance, add a new segmentation layer with source:
+#    precomputed://http://localhost:9000
+# Add segid 1 to its visible segments. The fill appears in BOTH 2D and 3D.
+```
+
+Drop `--no-upload` from step 1 to publish to `nokura://tracers/ben/<name>/` like `state_to_ng_layer_ben.py` does.
+
+**Why this is separate from the mesh-only pipeline:**
+
+`state_to_ng_layer_ben.py` produces mesh-only precomputed sources — its `info` claims `type: "segmentation"`, but no voxel chunks are written. NG renders the mesh in 3D and shows nothing in 2D because the 2D view needs per-voxel segment IDs to sample. This script voxelizes the mesh (subdivide method with adaptive `max_iter`, then `scipy.ndimage.binary_fill_holes` with 1-voxel padding to fill the interior) and writes chunked uint64 segmentation data alongside the mesh fragments. Chunks are anchored at the global EM voxel `(0, 0, 0)` so the 2D fill aligns with the same world coordinates as the 3D mesh.
+
+**Cost:** voxelization adds ~2-3 minutes per mesh; each output is 30 MB – 1 GB depending on resolution and region size. For ~75-90% of use cases where 2D fills aren't needed, stay on the mesh-only `state_to_ng_layer_ben.py`.
+
+**Tuning:**
+
+- `--seg-resolution rx,ry,rz` — voxel size in nm (default `64,64,90`). Coarser → smaller files, blockier 2D outline. `128,128,90` is a good middle ground for ~100 µm regions.
+- `--chunk-size` — chunk shape in voxels (default `128,128,16`). Raw uint64 stores zero voxels too, so each chunk file is `chunk_size_xyz * 8` bytes regardless of fill ratio; smaller chunks waste fewer bytes per empty corner but multiply HTTP requests.
+- All `state_to_ng_layer_ben.py` flags (`--method`, `--alpha`, `--datastack`, etc.) work the same way.
+
+**Notes:**
+
+- Auto-strips non-`type:point` annotations (e.g. stray `axis_aligned_bounding_box`) into a temp sanitized state file before meshing, since the upstream `get_anno_array_from_json` does `anno["point"]` blindly.
+- Adaptive subdivide `max_iter` is computed from the mesh's longest edge in scaled (pitch=1) space; the trimesh default of 10 trips on meshes whose edges are >1000 units long in scaled space.
+- Mesh fragment files on disk use `___` substitutes for `:` (Windows-safe). `serve_local_precomputed_ben.py` translates these on the fly via `translate_path` so NG can fetch them at the colon paths it expects; `bucket_upload_folder_ben.py` does the equivalent rename on upload.
+- Browsers treat `http://localhost` as a secure context, so the local server works with HTTPS NG instances (spelunker, ng-app, etc.) without mixed-content blocks.
+- **Re-running on the same workdir is safe.** The script `shutil.rmtree`s the `<scale_key>/` chunk directory before writing, so chunks from a previous run never leak into the new output. (Without this, a tighter mesh would leave behind orphan chunks from the wider previous mesh at the same scale, and NG would render the *union* — a confusing "drifting bbox" effect that's hard to diagnose visually.)
+- **Seg-volume bbox matches the datastack EM extent**, not the tight mesh bbox. Without this, NG draws a separate small yellow rectangle around just the mesh in addition to the EM's big rectangle, cluttering the view; matching the EM extent collapses them to one combined bbox. Implementation: the script reads the EM-derived `size * resolution` from the info written by `_write_volume_packaging` and re-expresses it at the new seg resolution. Assumes `em_offset == [0,0,0]` (true for BANC); warns otherwise.
+
+**Dependencies (in addition to the mesh pipeline):** `scipy` (already pulled in by `trimesh`).
+
 ### `merge_layers_to_ng_ben.py` — Multi-layer mesh merger
 
 Combines multiple annotation layers from a Neuroglancer state into **one** hosted mesh — versus `state_to_ng_layer_ben.py`, which builds one mesh per `--layer` invocation. Useful when N point-annotation clusters should be visualized as a single 3D region (e.g. 12 sub-regions of a brain structure → one watertight envelope for neuron-passes-through testing).
