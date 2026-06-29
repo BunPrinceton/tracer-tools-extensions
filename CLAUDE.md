@@ -64,11 +64,25 @@ The three Windows / nokura bugs the `_ben` variants exist to fix:
 2. Windows rejects `:` in filenames, so anything writing the precomputed mesh format locally (manifest `1:0`, fragment `1:0:1`) breaks. The `_ben` scripts write `___` substitutes locally and translate at upload time.
 3. Nokura objects default to private. Without `put_object_acl(..., ACL="public-read")` after each upload, browser fetches return 403 even though `cloudfiles ls` shows the files.
 
+## Upstream repo (renamed June 2026)
+
+Jay rebuilt his package as a NEW repo: **`jaybgager/tracertools`** (one word; package `tracertools`). The old `jaybgager/tracer_tools` (underscore) is abandoned. Ben's tracking fork is **`BunPrinceton/tracertools`**; canonical local clone is `C:\Users\Benjamin\Desktop\_scratch\tracertools_sync` (origin=fork, upstream=Jay).
+
+The new repo overlaps a lot of this repo's `_ben` mesh work and is good jump-board material for future scripts: `make_mesh_from_points` (internal `_alpha_shape_3d`), `make_volume_mesh_from_state_file`, `make_bucket_volume_from_obj`, `host_ng_volume_locally`, `bucket_copy_folder`, `get_anno_array_from_state_file` (renamed from `get_anno_array_from_json`), `get_config`.
+
+NOTE: the existing `_ben` scripts still import the OLD `tracer_tools` API (e.g. `from tracer_tools.utils import get_config, get_anno_array_from_json`). Migrating them to import `tracertools` (with its renamed functions) is a future iteration, not done yet. On this machine auto-detect grabs the wrong copy, so pass `--tracer-path "C:/Users/Benjamin/Desktop/_scratch/tracer_tools_sync/src"`.
+
+## Bucket utilities
+
+- `bucket_upload_folder_ben.py` — local folder → bucket (colon-name translation, public-read ACL, anon-HEAD verify).
+- `bucket_copy_folder_ben.py` — bucket→bucket copy; local stand-in for Jay's `tracertools.bucket_copy_folder` with our nokura-safe client. Mirrors his `(source_path, dest_path)` API. Used to copy meshes into the shared central folder `nokura://tracers/swamps/banc/individual_meshes/<NN>`.
+
 ## Dependencies
 
 - `caveclient` (pip) — requires CAVE credentials at `~/.cloudvolume/secrets/cave-secret.json`
-- `tracer_tools` — auto-discovered from several path candidates (see `_find_tracer_tools` / `_find_ben_dir` at the top of each script). Override with `--tracer-path`.
+- `tracer_tools` — auto-discovered from several path candidates (see `_find_tracer_tools` / `_find_ben_dir` at the top of each script). Override with `--tracer-path` (required on Ben's box; see Upstream repo note above).
 - Mesh pipeline only: `trimesh`, `cloud-volume`, `cloud-files`, `boto3`, `scipy`. Nokura uploads require `~/.cloudvolume/secrets/nokura-secret.json`.
+- **`cloud-files` must be >= 6.x.** Will's June-2026 fix (in 6.x) corrects a bucket-copy permissions bug where `transfer_to` forced copied objects private; older cloud-files (<=5.8.2) silently makes shared-folder copies unreadable. `cloud-volume` 12.8.0 formally pins `cloud-files<6.0.0` but works fine at 6.3.1 (conservative pin); suspect this skew first if the mesh builder errors oddly.
 - Python 3 standard library otherwise.
 
 ## Input Format
