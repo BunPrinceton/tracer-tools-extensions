@@ -1,8 +1,10 @@
 # Tracer Tools - Extensions
 
-Performance-oriented extensions for BANC (Brain and Nerve Cord) proofreading workflows, focused on **batched and parallelized** CAVE API calls for large ID sets.
+Standalone tools for BANC (Brain and Nerve Cord) proofreading workflows: fast ID/proofread lookups, a Neuroglancer mesh pipeline, and a link-restoration pipeline.
 
-This is **not a fork** of the upstream tracer tools. It collects standalone scripts that solve specific performance bottlenecks when working with thousands of IDs.
+This is **not a fork** of the upstream tracer tools — it's a collection of standalone scripts, each solving a specific bottleneck. Everything here is experimental; the README flags the recommended tool per task.
+
+**Most common task — take a list of IDs and get back the updated IDs with their proofread status?** → ⭐ `resolve_and_status.py` (first tool listed below).
 
 ---
 
@@ -42,51 +44,21 @@ The first version: supervoxel tracking + a materialized `backbone_proofread` tab
 
 ---
 
-### `fast_validate_ids.py` — ID Validator
+### `fast_validate_ids*.py` — ID-currency validator (ID-only)
 
-Checks whether root IDs are still current and resolves outdated ones to their latest version via supervoxel tracking.
+> **For updating a list of IDs *and* getting proofread status, use ⭐ `resolve_and_status.py` above.** Reach for these only when you want ID-currency validation **alone** for very large lists. They resolve via single-supervoxel tracking, which can pick a minor fragment on splits; `resolve_and_status.py` uses the split-robust `suggest_latest_roots` instead.
+
+Checks whether root IDs are still current and resolves outdated ones via supervoxel tracking. Parallelizes supervoxel lookups across 20 threads, then batches `get_roots()` (5,000/batch). Outputs a detailed report (`*_updated.txt`) and a clean ID list (`*_updated_clean.txt`).
+
+Two near-duplicate copies exist; **prefer the portable one:**
+
+- **`fast_validate_ids_updated_auto_detect_path.py`** — portable version for coworkers/other machines. Auto-detects `tracer_tools/src` relative to the script; if that fails, pass `--tracer-path "C:\path\to\tracer_tools\src"` (open the `tracer_tools` folder, go into `src`, copy that path from the address bar). Auto-detect works when the script sits next to / one level above `tracer_tools/`, or next to a `Tracer - Workspace/` that contains it.
+- **`fast_validate_ids.py`** — the original; kept for reference. Same behavior; use the portable copy instead.
 
 ```bash
-python fast_validate_ids.py --input ids.txt
-python fast_validate_ids.py --input ids.txt --output results.txt --workers 20
+python fast_validate_ids_updated_auto_detect_path.py --input ids.txt
+python fast_validate_ids_updated_auto_detect_path.py --input ids.txt --output results.txt --workers 20
 ```
-
-- Parallelizes supervoxel lookups across 20 threads, then batches `get_roots()` calls (5,000 per batch)
-- Outputs a detailed report (`*_updated.txt`) and a clean ID list (`*_updated_clean.txt`)
-- Uses supervoxel tracking instead of `get_latest_roots()` to accurately follow splits/merges
-
-### `fast_validate_ids_updated_auto_detect_path.py` — Portable ID Validator
-
-> For updating a list of IDs **and** getting proofread status, use ⭐ `resolve_and_status.py` above. Reach for these `fast_validate_ids*` scripts only when you want ID-currency validation **alone** for very large lists and don't need proofread status. Note they resolve via single-supervoxel tracking, which can pick a minor fragment on splits; `resolve_and_status.py` uses `suggest_latest_roots` instead.
-
-**The portable ID-only validator for new users / coworkers.** It does everything the original `fast_validate_ids.py` does, but removes hardcoded paths so it works on any machine.
-
-The script auto-detects the `tracer_tools/src` directory relative to where the script is saved. If auto-detect fails, you can point it manually with `--tracer-path`.
-
-**Quick start:**
-
-1. Install dependencies:
-   ```
-   pip install caveclient
-   ```
-
-2. Save the script anywhere on your computer and try running it:
-   ```bash
-   python fast_validate_ids_updated_auto_detect_path.py --input ids.txt
-   ```
-
-3. If you get an error saying it can't find `tracer_tools/src`, use `--tracer-path`:
-   ```bash
-   python fast_validate_ids_updated_auto_detect_path.py --input ids.txt --tracer-path "C:\path\to\tracer_tools\src"
-   ```
-   To find the right path: locate the `tracer_tools` folder on your computer, open the `src` subfolder inside it, and copy that full path from your file explorer address bar.
-
-**Auto-detect works when the script is placed:**
-- Next to the `tracer_tools/` folder
-- One level above the `tracer_tools/` folder
-- Inside or next to a `Tracer - Workspace/` folder that contains `tracer_tools/`
-
-**Output:** Same as the original — a detailed report (`*_updated.txt`) and a clean ID list (`*_updated_clean.txt`).
 
 ---
 
@@ -215,26 +187,65 @@ python merge_layers_to_ng_ben.py state.json --name foo --dry-run
 
 A complete worked example with the resulting OBJ and a public Neuroglancer source URL lives in [`examples/`](examples/).
 
+### `bucket_copy_folder_ben.py` — bucket-to-bucket precomputed copy
+
+Copies a precomputed folder from one bucket to another with the nokura-safe client (colon-name translation, public-read ACLs). A local stand-in for Jay's `tracertools.bucket_copy_folder`, mirroring its `(source_path, dest_path)` API — used to copy meshes into the shared central folder `nokura://tracers/swamps/banc/individual_meshes/<NN>`. Requires `cloud-files >= 6.x` (older versions silently make shared-folder copies unreadable).
+
+---
+
+## Link restoration pipeline
+
+Collect old Neuroglancer / appspot / CAVE-state share links, classify which still work, and rebuild the dead-but-restorable ones into working open-in-viewer URLs. Companion to the borkbook Link Restorer web tool (`/link-restore/`) — reuses the same `restore_old_ng_links.py` fetch/route logic so the CLI and web tool agree. The guiding rule throughout: **a link's host does not identify the dataset; only the fetched state contents do.**
+
+- **`link_pipeline.py`** — the end-to-end orchestrator. Point it at Google Sheets and/or a text file of pasted links; get back one self-contained HTML report of clickable **fixed** links grouped by status.
+  ```bash
+  python link_pipeline.py --input links.txt --output report.html
+  python link_pipeline.py --sheet <SHEET_ID> --output report.html
+  python link_pipeline.py --sheet <ID1> --sheet <ID2> --input more.txt -o report.html
+  python link_pipeline.py --input links.txt --no-fetch        # shape-only, offline
+  ```
+  If `restore_old_ng_links.py` isn't auto-found, pass `--restore-path <its dir>`.
+- **`extract_sheet_links.py`** — stage 1 (collect). Scans every cell of one or more worksheets and pulls out anything that looks like a shareable NG link/source (matches `appspot.com`, `json_url=`, `nglstate`, `graphene://`, `ngl.flywire.ai`, `local_id=`, `spelunker`); captures an adjacent "Notes" column when present. OAuth via your personal Google account (`google_credentials.json`; token cached at `~/.tracer_tools_token.pickle`).
+  ```bash
+  python extract_sheet_links.py --sheet <SHEET_ID> --output links.json
+  python extract_sheet_links.py --sheet <SHEET_ID> --worksheet "Sheet1" --output links.csv --format csv
+  ```
+- **`validate_links.py`** — stage 2 (classify). Given any link shape, decides whether it still works and why, returning exactly one status: `ok`, `dead-host`, `truncated-id`, `auth-gated`, `dead-em`, `seg-gone`, `local-id-unportable`, `unrecognized`. Optionally fetches stored states with your CAVE token to route by real contents.
+  ```bash
+  python validate_links.py --input links.txt --output report.json
+  python validate_links.py --input links.txt --no-fetch          # shape-only, no network
+  ```
+
+**Dependencies:** `gspread` + `google-auth-oauthlib` (sheet extraction only); `caveclient` for state fetching. Auth/secrets are read only from the standard locations and never printed.
+
+---
+
 ### Shared options
 
-All scripts accept: `--input/-i` (required), `--output/-o` (auto-named from input), `--datastack/-d` (default: `brain_and_nerve_cord`), `--workers/-w` (default: 20).
+The **ID/coord tools** (`resolve_and_status.py`, `fast_*`, `check_backbone_proofread*.py`, `fast_get_coords.py`) accept: `--input/-i` (required), `--output/-o` (auto-named from input), `--datastack/-d` (default: `brain_and_nerve_cord`), `--workers/-w` (default: 20). Input format: plain text, one ID per line; arrow notation (`N → ID` or `N -> ID`) is also accepted.
 
-The portable version also accepts: `--tracer-path` (manual path to `tracer_tools/src`, only needed if auto-detect fails).
-
-Input format: plain text, one ID per line. Arrow notation (`N → ID` or `N -> ID`) is also supported.
+The mesh and link tools take their own arguments (a positional `state.json`, `--sheet`, etc.) — see each section above.
 
 ---
 
 ## Dependencies
 
-- **Python 3**
-- **caveclient** (`pip install caveclient`) — requires CAVE credentials at `~/.cloudvolume/secrets/cave-secret.json`
+Everything needs **Python 3** and CAVE credentials at `~/.cloudvolume/secrets/cave-secret.json`. Beyond that, deps are per-tool — install only what you use:
+
+| Tool group | Requires |
+|---|---|
+| ID/proofread + coords (`resolve_and_status.py`, `fast_*`, `check_backbone_proofread*.py`) | `caveclient` (+ `pandas`) |
+| Hybrid audit (`check_backbone_proofread_hybrid.py`) | `caveclient`, `pandas`, **`banc`** — `pip install banc`, then restore `pip install cloud-files==6.3.1` (banc downgrades it and breaks the mesh pipeline) |
+| Mesh pipeline (`state_to_ng_*`, `*_volume_ben.py`, `merge_layers_to_ng_ben.py`, bucket tools) | `trimesh`, `cloud-volume`, **`cloud-files>=6.x`**, `boto3`, `scipy` (+ `manifold3d`/`scikit-image`/`fast-simplification` for the merger's optional flags). Nokura uploads need `~/.cloudvolume/secrets/nokura-secret.json` |
+| Link pipeline (`link_pipeline.py`, `extract_sheet_links.py`, `validate_links.py`) | `gspread` + `google-auth-oauthlib` (sheet extraction), `caveclient` (state fetch) |
+
+The `_ben` mesh scripts still import the **old** `tracer_tools` API and auto-detect it from several path candidates; on machines where auto-detect grabs the wrong copy, pass `--tracer-path`. `resolve_and_status.py` needs no `--tracer-path` (pure caveclient).
 
 ---
 
 ## Why these are faster
 
-Both scripts share the same pattern: a single shared `CAVEclient` instance, threaded per-ID lookups for the slow step, and batched bulk API calls for the fast step. This avoids the overhead of sequential per-ID requests and redundant client initialization. ~5,000 IDs typically complete in under a minute.
+The ID/coord scripts share one pattern: a single shared `CAVEclient` instance, threaded per-ID lookups for the slow step, and batched bulk API calls for the fast step. This avoids sequential per-ID requests and redundant client initialization — ~5,000 IDs typically complete in under a minute (`resolve_and_status.py` does ~330 in ~20 s).
 
 ---
 
