@@ -53,20 +53,20 @@ Supervoxel tracking is used intentionally instead of `get_latest_roots()` becaus
 
 Two extra files for the case where the user wants the NG layer to render in **both 2D cross-sections and 3D**, not just 3D:
 
-- `state_to_ng_seg_layer_ben.py` — parallels `state_to_ng_layer_ben.py` but additionally voxelizes the generated mesh into a chunked precomputed segmentation volume so NG's 2D panel has per-voxel segment IDs to sample. Uses `trimesh.voxelized(method="subdivide", max_iter=adaptive)` + `scipy.ndimage.binary_fill_holes` with 1-voxel padding (the trimesh default `vox.fill()` is a no-op on shell voxelizations in current trimesh). Sanitizes the state file first by stripping non-`type:point` annotations, since the upstream `get_anno_array_from_json` does `anno["point"]` blindly and crashes on `axis_aligned_bounding_box` mixed in. CLI flags: same as `state_to_ng_layer_ben.py` plus `--seg-resolution rx,ry,rz` (nm/voxel, default `64,64,90`), `--chunk-size` (voxels, default `128,128,16`), and `--no-upload` for local-only generation. Two behaviors worth knowing about: (1) `shutil.rmtree`s `<scale_key>/` before writing chunks so re-runs don't leak orphan chunks from a wider previous mesh (debugging that visually is painful — the seg appears to "drift"); (2) preserves the EM-derived size/resolution that `_write_volume_packaging` wrote, so the seg layer's bbox in NG collapses into the EM bbox rather than drawing a second small yellow rectangle. Assumes `em_offset == [0,0,0]` (BANC); warns otherwise since chunks are anchored at global voxel 0.
+- `state_to_ng_seg_layer_ben.py` — parallels `state_to_ng_layer_ben.py` but additionally voxelizes the generated mesh into a chunked precomputed segmentation volume so NG's 2D panel has per-voxel segment IDs to sample. Uses `trimesh.voxelized(method="subdivide", max_iter=adaptive)` + `scipy.ndimage.binary_fill_holes` with 1-voxel padding (the trimesh default `vox.fill()` is a no-op on shell voxelizations in current trimesh). Sanitizes the state file first by stripping non-`type:point` annotations, since the upstream `get_anno_array_from_json` reads `anno["point"]` directly and errors when an `axis_aligned_bounding_box` is mixed in. CLI flags: same as `state_to_ng_layer_ben.py` plus `--seg-resolution rx,ry,rz` (nm/voxel, default `64,64,90`), `--chunk-size` (voxels, default `128,128,16`), and `--no-upload` for local-only generation. Two behaviors worth knowing about: (1) `shutil.rmtree`s `<scale_key>/` before writing chunks so re-runs don't leak orphan chunks from a wider previous mesh (debugging that visually is painful — the seg appears to "drift"); (2) preserves the EM-derived size/resolution that `_write_volume_packaging` wrote, so the seg layer's bbox in NG collapses into the EM bbox rather than drawing a second small yellow rectangle. Assumes `em_offset == [0,0,0]` (BANC); warns otherwise since chunks are anchored at global voxel 0.
 - `serve_local_precomputed_ben.py` — Python stdlib `http.server` subclass that serves a precomputed folder with `Access-Control-Allow-Origin: *` headers and translates `:` → `___` in request paths (since the Windows-safe local mesh filenames use `___` instead of `:`). Lets you preview a `--no-upload` build in NG by adding a layer with source `precomputed://http://localhost:9000`. Browsers treat `http://localhost` as a secure context so this works against hosted HTTPS NG instances.
 
 Local-test workflow: `state_to_ng_seg_layer_ben.py ... --no-upload` → `serve_local_precomputed_ben.py <workdir>/image` → paste `precomputed://http://localhost:9000` into a new NG segmentation layer → add segid 1 to visible segments. The mesh-only pipeline remains the default for the ~75-90% of cases where 2D fills aren't needed (voxelization adds ~2-3 minutes and 30 MB - 1 GB of output per mesh).
 
-The three Windows / nokura bugs the `_ben` variants exist to fix:
+Three Windows / nokura environment differences the `_ben` variants handle (the upstream code assumes Linux + standard S3):
 
-1. `cloudfiles.monitoring.TransmissionMonitor.end_io` crashes on `intervaltree`'s "no zero-length intervals" guard when local IO is sub-microsecond (every `_ben` script applies a monkey-patch).
-2. Windows rejects `:` in filenames, so anything writing the precomputed mesh format locally (manifest `1:0`, fragment `1:0:1`) breaks. The `_ben` scripts write `___` substitutes locally and translate at upload time.
+1. `cloudfiles.monitoring.TransmissionMonitor.end_io` trips `intervaltree`'s "no zero-length intervals" guard when local IO is sub-microsecond (every `_ben` script applies a monkey-patch).
+2. Windows doesn't allow `:` in filenames, so writing the precomputed mesh format locally (manifest `1:0`, fragment `1:0:1`) needs substitution. The `_ben` scripts write `___` substitutes locally and translate at upload time.
 3. Nokura objects default to private. Without `put_object_acl(..., ACL="public-read")` after each upload, browser fetches return 403 even though `cloudfiles ls` shows the files.
 
 ## Upstream repo (renamed June 2026)
 
-Jay rebuilt his package as a NEW repo: **`jaybgager/tracertools`** (one word; package `tracertools`). The old `jaybgager/tracer_tools` (underscore) is abandoned. Ben's tracking fork is **`BunPrinceton/tracertools`**; canonical local clone is `C:\Users\Benjamin\Desktop\_scratch\tracertools_sync` (origin=fork, upstream=Jay).
+The package was rebuilt as a NEW repo: **`jaybgager/tracertools`** (one word; package `tracertools`). The old `jaybgager/tracer_tools` (underscore) is superseded. Ben's tracking fork is **`BunPrinceton/tracertools`**; canonical local clone is `C:\Users\Benjamin\Desktop\_scratch\tracertools_sync` (origin=fork, upstream=`jaybgager/tracertools`).
 
 The new repo overlaps a lot of this repo's `_ben` mesh work and is good jump-board material for future scripts: `make_mesh_from_points` (internal `_alpha_shape_3d`), `make_volume_mesh_from_state_file`, `make_bucket_volume_from_obj`, `host_ng_volume_locally`, `bucket_copy_folder`, `get_anno_array_from_state_file` (renamed from `get_anno_array_from_json`), `get_config`.
 
@@ -75,7 +75,7 @@ NOTE: the existing `_ben` scripts still import the OLD `tracer_tools` API (e.g. 
 ## Bucket utilities
 
 - `bucket_upload_folder_ben.py` — local folder → bucket (colon-name translation, public-read ACL, anon-HEAD verify).
-- `bucket_copy_folder_ben.py` — bucket→bucket copy; local stand-in for Jay's `tracertools.bucket_copy_folder` with our nokura-safe client. Mirrors his `(source_path, dest_path)` API. Used to copy meshes into the shared central folder `nokura://tracers/swamps/banc/individual_meshes/<NN>`.
+- `bucket_copy_folder_ben.py` — bucket→bucket copy; local stand-in for the upstream `tracertools.bucket_copy_folder` with our nokura-safe client. Mirrors its `(source_path, dest_path)` API. Used to copy meshes into the shared central folder `nokura://tracers/swamps/banc/individual_meshes/<NN>`.
 
 ## Dependencies
 
