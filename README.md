@@ -8,6 +8,40 @@ This is **not a fork** of the upstream tracer tools. It collects standalone scri
 
 ## Included tools
 
+### ⭐ `resolve_and_status.py` — Update IDs + proofread status (recommended — use this today)
+
+**The current best way to take a list of IDs and get back the updated (current) IDs with their proofread status.** It uses two sanctioned, ground-truth CAVE calls and nothing custom — so the output needs no external corroboration and cannot produce a false positive:
+
+1. `chunkedgraph.suggest_latest_roots(id)` — resolves each input to its **current** ID by max voxel-overlap (CAVE's canonical updater). Returns the ID unchanged if already current, so no separate `is_latest_roots` step is needed. On a split it picks the largest-overlap piece.
+2. `materialize.live_live_query("backbone_proofread")` — the same **live** status call banc-bot runs for `<id>??`. Because it's live (not a materialized snapshot) it never lags behind recent proofreading, and it reports proofread only when a real label exists on that cell right now.
+
+```bash
+python resolve_and_status.py --input ids.txt
+python resolve_and_status.py -i ids.txt -o out.tsv --workers 20
+```
+
+**Output** (`*_status.tsv`): `input_id · current_id · id_changed · proofread_status`. No `--tracer-path` needed (pure caveclient). ~330 IDs in ~20 s.
+
+Prefer this over `fast_validate_ids.py` for the "is it current **and** is it proofread" question — it adds proofread status and uses `suggest_latest_roots` (robust on splits) instead of following one supervoxel (which can land on a minor fragment of a split neuron).
+
+> **Split note:** after a real split there is no single canonical "current ID" — it depends which piece you mean, exactly as in Neuroglancer (a 2D double-click returns whichever piece you clicked). `suggest_latest_roots` returns the biggest-overlap piece; treat those rows as a human "look at it" flag, not a tool error.
+
+#### `check_backbone_proofread_hybrid.py` — three-way audit / corroboration
+
+When you need to **prove** the answer (skeptics, validating a new script), this runs the same IDs through three engines side by side and flags every disagreement:
+
+- **ours** — supervoxel tracking + materialized `query_table` (the original method)
+- **banc-bot** — its own code, imported from the `banc` package (`is_latest_roots` + `banc.lookup.annotations`, i.e. the literal `<id>??`), plus a `*_bancbot_log.txt` that reproduces banc-bot's Slack replies as an offline audit trail
+- **cave** — `suggest_latest_roots` as an independent resolver
+
+It emits reconciled `best_current_id` / `best_proofread` columns (which match `resolve_and_status.py`) alongside the per-engine columns and an agreement verdict, so nothing is silently overridden. Needs the `banc` package: `pip install banc` — then restore `pip install cloud-files==6.3.1` afterward (banc downgrades cloud-files, which breaks the mesh pipeline). banc reads its token under the default `token` key via `banc.auth.configs['cave_auth_token_key']='token'` (handled in the script).
+
+#### `check_backbone_proofread.py` — original (superseded, kept for reference)
+
+The first version: supervoxel tracking + a materialized `backbone_proofread` table map. Still correct on a freshly-materialized dataset with no splits, but it reads the **materialized snapshot** (can lag weeks behind live proofreading) and follows a **single supervoxel** (split-fragile). Superseded by `resolve_and_status.py`; kept for historical reference. See the hybrid tool for a line-by-line comparison of the two methods.
+
+---
+
 ### `fast_validate_ids.py` — ID Validator
 
 Checks whether root IDs are still current and resolves outdated ones to their latest version via supervoxel tracking.
@@ -21,9 +55,11 @@ python fast_validate_ids.py --input ids.txt --output results.txt --workers 20
 - Outputs a detailed report (`*_updated.txt`) and a clean ID list (`*_updated_clean.txt`)
 - Uses supervoxel tracking instead of `get_latest_roots()` to accurately follow splits/merges
 
-### `fast_validate_ids_updated_auto_detect_path.py` — Portable ID Validator (Recommended)
+### `fast_validate_ids_updated_auto_detect_path.py` — Portable ID Validator
 
-**This is the recommended version for new users / coworkers.** It does everything the original `fast_validate_ids.py` does, but removes hardcoded paths so it works on any machine.
+> For updating a list of IDs **and** getting proofread status, use ⭐ `resolve_and_status.py` above. Reach for these `fast_validate_ids*` scripts only when you want ID-currency validation **alone** for very large lists and don't need proofread status. Note they resolve via single-supervoxel tracking, which can pick a minor fragment on splits; `resolve_and_status.py` uses `suggest_latest_roots` instead.
+
+**The portable ID-only validator for new users / coworkers.** It does everything the original `fast_validate_ids.py` does, but removes hardcoded paths so it works on any machine.
 
 The script auto-detects the `tracer_tools/src` directory relative to where the script is saved. If auto-detect fails, you can point it manually with `--tracer-path`.
 
