@@ -99,7 +99,7 @@ Prints back the NG layer source URL (e.g. `https://.../<name>|neuroglancer-preco
 - `obj_to_volume_ben.py` — OBJ → precomputed volume folder. Pulls volume bounds from the datastack's EM-source `info` so the bbox works for any datastack (BANC, FlyWire, MANC, retina), not just BANC.
 - `bucket_upload_folder_ben.py` — folder → bucket. Translates `___` substitutes back to `:` in object keys (Windows-safe filenames on disk, real colon names on the bucket). Sets `ACL=public-read` per file via boto3. Verifies anonymous HTTPS HEAD before returning.
 
-**Why these exist:** Jay's upstream `json_to_volume` / `obj_to_volume` / `bucket_upload_folder` crash on Windows + nokura due to (a) `intervaltree` zero-length intervals from sub-µs local IO, (b) Windows rejecting `:` in filenames, and (c) nokura's S3 emulator rejecting bulk `DeleteObjects` without a `Content-MD5` header. These `_ben` versions bypass all three.
+**Why these exist:** the upstream `json_to_volume` / `obj_to_volume` / `bucket_upload_folder` were written for a Linux + standard-S3 setup; on this Windows + nokura box three environment differences need handling: (a) `intervaltree` rejects the zero-length intervals that sub-µs local IO produces, (b) Windows doesn't allow `:` in filenames, and (c) nokura's S3 emulator requires a `Content-MD5` header on bulk `DeleteObjects`. These `_ben` versions adapt for all three.
 
 **Dependencies (beyond the existing ones):** `trimesh`, `cloud-volume`, `cloud-files`, `boto3`, `scipy`. Nokura uploads require `~/.cloudvolume/secrets/nokura-secret.json`.
 
@@ -139,7 +139,7 @@ Drop `--no-upload` from step 1 to publish to `nokura://tracers/ben/<name>/` like
 
 **Notes:**
 
-- Auto-strips non-`type:point` annotations (e.g. stray `axis_aligned_bounding_box`) into a temp sanitized state file before meshing, since the upstream `get_anno_array_from_json` does `anno["point"]` blindly.
+- Auto-strips non-`type:point` annotations (e.g. stray `axis_aligned_bounding_box`) into a temp sanitized state file before meshing, since the upstream `get_anno_array_from_json` reads `anno["point"]` directly and expects point annotations only.
 - Adaptive subdivide `max_iter` is computed from the mesh's longest edge in scaled (pitch=1) space; the trimesh default of 10 trips on meshes whose edges are >1000 units long in scaled space.
 - Mesh fragment files on disk use `___` substitutes for `:` (Windows-safe). `serve_local_precomputed_ben.py` translates these on the fly via `translate_path` so NG can fetch them at the colon paths it expects; `bucket_upload_folder_ben.py` does the equivalent rename on upload.
 - Browsers treat `http://localhost` as a secure context, so the local server works with HTTPS NG instances (spelunker, ng-app, etc.) without mixed-content blocks.
@@ -189,7 +189,7 @@ A complete worked example with the resulting OBJ and a public Neuroglancer sourc
 
 ### `bucket_copy_folder_ben.py` — bucket-to-bucket precomputed copy
 
-Copies a precomputed folder from one bucket to another with the nokura-safe client (colon-name translation, public-read ACLs). A local stand-in for Jay's `tracertools.bucket_copy_folder`, mirroring its `(source_path, dest_path)` API — used to copy meshes into the shared central folder `nokura://tracers/swamps/banc/individual_meshes/<NN>`. Requires `cloud-files >= 6.x` (older versions silently make shared-folder copies unreadable).
+Copies a precomputed folder from one bucket to another with the nokura-safe client (colon-name translation, public-read ACLs). A local stand-in for the upstream `tracertools.bucket_copy_folder`, mirroring its `(source_path, dest_path)` API — used to copy meshes into the shared central folder `nokura://tracers/swamps/banc/individual_meshes/<NN>`. Requires `cloud-files >= 6.x` (older versions silently make shared-folder copies unreadable).
 
 ---
 
@@ -251,4 +251,4 @@ The ID/coord scripts share one pattern: a single shared `CAVEclient` instance, t
 
 ## Relationship to upstream tools
 
-These scripts are inspired by Princeton tracer tooling but are independently maintained. They don't aim to stay in sync with upstream — they just need to produce correct output faster.
+These scripts build on Princeton tracer tooling but are independently maintained. They don't aim to stay in sync with upstream — they're tuned for speed and for this Windows + nokura environment.
